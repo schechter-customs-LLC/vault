@@ -23,7 +23,7 @@ A secure application for storing and managing encrypted text and files. Built wi
 
 1. Clone the repository:
 ```bash
-git clone [repository-url]
+git clone https://github.com/schechter-customs-LLC/vault.git
 cd vault
 ```
 
