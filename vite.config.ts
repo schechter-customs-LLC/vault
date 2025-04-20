@@ -10,4 +10,18 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./src/setupTests.ts'],
   },
+  server: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+  optimizeDeps: {
+    exclude: ['@peculiar/webcrypto', 'crypto']
+  },
+  // Enable Node.js API in renderer process
+  base: './',
+  build: {
+    target: 'esnext',
+  },
 });

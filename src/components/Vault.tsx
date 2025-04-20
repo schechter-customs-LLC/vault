@@ -16,7 +16,20 @@ import {
     VisibilityOff
 } from '@mui/icons-material';
 import { encryptData, decryptData, validatePassword } from '../utils/encryption';
-import { StoredVaultItem, saveVaultItems, getVaultItems, exportVaultData, importVaultData, lockVault, unlockVault, getVaultState } from '../utils/storage';
+import { 
+    StoredVaultItem, 
+    saveVaultItems, 
+    getVaultItems, 
+    exportVaultData, 
+    importVaultData, 
+    lockVault, 
+    unlockVault, 
+    getVaultState,
+    initializeVaultDirectory,
+    saveFileToVault,
+    readFileFromVault
+} from '../utils/storage';
+import { SetupWizard } from './SetupWizard';
 import zxcvbn from 'zxcvbn';
 import { saveAs } from 'file-saver';
 
@@ -24,6 +37,10 @@ const MotionContainer = motion(Paper);
 const MotionBox = motion(Box);
 
 export const Vault: React.FC = () => {
+    // Add new state for initialization
+    const [initialized, setInitialized] = useState<boolean>(false);
+    const [loading, setLoading] = useState(true);
+
     const [password, setPassword] = useState('');
     const [confirmPassword, setConfirmPassword] = useState('');
     const [inputData, setInputData] = useState('');
@@ -32,15 +49,15 @@ export const Vault: React.FC = () => {
     const [category, setCategory] = useState('general');
     const [decryptedView, setDecryptedView] = useState<{[key: string]: string}>({});
     const [selectedTab, setSelectedTab] = useState('text');
-    const [loading, setLoading] = useState(false);
     const [passwordStrength, setPasswordStrength] = useState(0);
     const [isLocked, setIsLocked] = useState(true);
     const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const [isInitializing, setIsInitializing] = useState(true);
+    const [vaultReady, setVaultReady] = useState(false);
 
     useEffect(() => {
-        loadVaultItems();
-        checkVaultState();
+        initializeVault();
     }, []);
 
     useEffect(() => {
@@ -48,9 +65,55 @@ export const Vault: React.FC = () => {
         setPasswordStrength(result.score);
     }, [password]);
 
+    const initializeVault = async () => {
+        try {
+            setIsInitializing(true);
+            // First check if vault directory is already selected
+            const state = await getVaultState();
+            
+            if (!state.vaultDirectoryHandle) {
+                // Ask user to select vault directory
+                await initializeVaultDirectory();
+            }
+            
+            setVaultReady(true);
+            await loadVaultItems();
+            await checkVaultState();
+        } catch (err) {
+            setError('Failed to initialize vault directory. Please try again.');
+            setVaultReady(false);
+        } finally {
+            setIsInitializing(false);
+        }
+    };
+
     const checkVaultState = async () => {
-        const state = await getVaultState();
-        setIsLocked(state.isLocked);
+        try {
+            const state = await getVaultState();
+            setInitialized(state.isInitialized);
+            if (state.isInitialized) {
+                await loadVaultItems();
+                const categories = await getCategories();
+                setCategory(categories[0]?.toLowerCase() || 'general');
+            }
+        } catch (err) {
+            setError('Failed to check vault initialization');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleSetupComplete = async (config: VaultConfig) => {
+        try {
+            setLoading(true);
+            await initializeVault(config);
+            setInitialized(true);
+            setCategory(config.categories[0]?.toLowerCase() || 'general');
+        } catch (err) {
+            setError('Failed to initialize vault');
+        } finally {
+            setLoading(false);
+        }
     };
 
     const loadVaultItems = async () => {
@@ -149,22 +212,8 @@ export const Vault: React.FC = () => {
             const newItems: StoredVaultItem[] = [];
 
             for (const file of selectedFiles) {
-                const reader = new FileReader();
-                const fileData = await new Promise<string>((resolve, reject) => {
-                    reader.onload = (e) => resolve(e.target?.result as string);
-                    reader.onerror = () => reject(new Error('Failed to read file'));
-                    reader.readAsDataURL(file);
-                });
-
-                const encryptedData = encryptData(fileData, password);
-                newItems.push({
-                    id: Date.now().toString() + Math.random(),
-                    encryptedData,
-                    category,
-                    fileName: file.name,
-                    type: 'file',
-                    createdAt: Date.now()
-                });
+                const item = await saveFileToVault(file, password, category);
+                newItems.push(item);
             }
 
             const updatedItems = [...vaultItems, ...newItems];
@@ -183,14 +232,25 @@ export const Vault: React.FC = () => {
         }
     };
 
-    const handleDecrypt = (id: string, encryptedData: string) => {
+    const handleDecrypt = async (id: string, encryptedData: string) => {
         if (isLocked) {
             setError('Please unlock the vault first');
             return;
         }
 
         try {
-            const decrypted = decryptData(encryptedData, password);
+            const item = vaultItems.find(item => item.id === id);
+            if (!item) {
+                throw new Error('Item not found');
+            }
+
+            let decrypted: string;
+            if (item.type === 'file') {
+                decrypted = await readFileFromVault(item, password);
+            } else {
+                decrypted = decryptData(encryptedData, password);
+            }
+
             setDecryptedView(prev => ({
                 ...prev,
                 [id]: decrypted
@@ -282,324 +342,351 @@ export const Vault: React.FC = () => {
         }
     };
 
+    // Show loading state
+    if (loading) {
+        return (
+            <Container sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
+                <CircularProgress />
+            </Container>
+        );
+    }
+
+    // Show setup wizard if vault is not initialized
+    if (!initialized) {
+        return <SetupWizard onComplete={handleSetupComplete} />;
+    }
+
     return (
         <Container maxWidth="sm">
-            <MotionContainer
-                initial="hidden"
-                animate="visible"
-                exit="exit"
-                variants={containerVariants}
-                sx={{ 
-                    p: 4, 
-                    mt: 4,
-                    backdropFilter: 'blur(10px)',
-                    background: 'rgba(31, 41, 55, 0.8)',
-                    border: '1px solid rgba(255, 255, 255, 0.1)',
-                    boxShadow: '0 4px 30px rgba(0, 0, 0, 0.1)'
-                }}
-            >
-                <Typography 
-                    variant="h4" 
-                    component="h1" 
-                    gutterBottom 
+            {isInitializing ? (
+                <CircularProgress />
+            ) : !vaultReady ? (
+                <Button
+                    fullWidth
+                    variant="contained"
+                    onClick={initializeVault}
+                    startIcon={<Folder />}
+                >
+                    Select Vault Directory
+                </Button>
+            ) : (
+                <MotionContainer
+                    initial="hidden"
+                    animate="visible"
+                    exit="exit"
+                    variants={containerVariants}
                     sx={{ 
-                        display: 'flex', 
-                        alignItems: 'center',
-                        gap: 2,
-                        mb: 4
+                        p: 4, 
+                        mt: 4,
+                        backdropFilter: 'blur(10px)',
+                        background: 'rgba(31, 41, 55, 0.8)',
+                        border: '1px solid rgba(255, 255, 255, 0.1)',
+                        boxShadow: '0 4px 30px rgba(0, 0, 0, 0.1)'
                     }}
                 >
-                    <Security sx={{ fontSize: 40 }} />
-                    Secure Vault
-                    {isLocked ? 
-                        <LockOutlined color="error" sx={{ ml: 'auto' }} /> : 
-                        <LockOpenOutlined color="success" sx={{ ml: 'auto' }} />
-                    }
-                </Typography>
-
-                {error && (
-                    <Alert 
-                        severity="error" 
+                    <Typography 
+                        variant="h4" 
+                        component="h1" 
+                        gutterBottom 
                         sx={{ 
-                            mb: 2,
-                            animation: 'shake 0.5s ease-in-out',
-                            '@keyframes shake': {
-                                '0%, 100%': { transform: 'translateX(0)' },
-                                '25%': { transform: 'translateX(-10px)' },
-                                '75%': { transform: 'translateX(10px)' }
-                            }
+                            display: 'flex', 
+                            alignItems: 'center',
+                            gap: 2,
+                            mb: 4
                         }}
                     >
-                        {error}
-                    </Alert>
-                )}
+                        <Security sx={{ fontSize: 40 }} />
+                        Secure Vault
+                        {isLocked ? 
+                            <LockOutlined color="error" sx={{ ml: 'auto' }} /> : 
+                            <LockOpenOutlined color="success" sx={{ ml: 'auto' }} />
+                        }
+                    </Typography>
 
-                <Box sx={{ mb: 2 }}>
-                    <TextField
-                        fullWidth
-                        type="password"
-                        label="Password (10+ chars, include letters, numbers, symbols)"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        margin="normal"
-                        disabled={!isLocked && vaultItems.length > 0}
-                        // @ts-ignore deprecated but still functional
-                        InputProps={{
-                            startAdornment: <Security sx={{ mr: 1, color: 'text.secondary' }} />
-                        }}
-                    />
-                    <TextField
-                        fullWidth
-                        type="password"
-                        label="Confirm Password"
-                        value={confirmPassword}
-                        onChange={(e) => setConfirmPassword(e.target.value)}
-                        margin="normal"
-                        disabled={!isLocked && vaultItems.length > 0}
-                        // @ts-ignore deprecated but still functional
-                        InputProps={{
-                            startAdornment: <Security sx={{ mr: 1, color: 'text.secondary' }} />
-                        }}
-                    />
-                    <MotionBox
-                        initial={{ scaleX: 0 }}
-                        animate={{ scaleX: 1 }}
-                        transition={{ duration: 0.5 }}
-                        sx={{ mt: 1, height: 4, bgcolor: '#eee', transformOrigin: 'left' }}
-                    >
-                        <Box
-                            sx={{
-                                height: '100%',
-                                width: `${(passwordStrength + 1) * 20}%`,
-                                bgcolor: getPasswordStrengthColor(),
-                                transition: 'all 0.3s'
+                    {error && (
+                        <Alert 
+                            severity="error" 
+                            sx={{ 
+                                mb: 2,
+                                animation: 'shake 0.5s ease-in-out',
+                                '@keyframes shake': {
+                                    '0%, 100%': { transform: 'translateX(0)' },
+                                    '25%': { transform: 'translateX(-10px)' },
+                                    '75%': { transform: 'translateX(10px)' }
+                                }
+                            }}
+                        >
+                            {error}
+                        </Alert>
+                    )}
+
+                    <Box sx={{ mb: 2 }}>
+                        <TextField
+                            fullWidth
+                            type="password"
+                            label="Password (10+ chars, include letters, numbers, symbols)"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            margin="normal"
+                            disabled={!isLocked && vaultItems.length > 0}
+                            // @ts-ignore deprecated but still functional
+                            InputProps={{
+                                startAdornment: <Security sx={{ mr: 1, color: 'text.secondary' }} />
                             }}
                         />
-                    </MotionBox>
-                </Box>
-
-                {isLocked ? (
-                    <Button
-                        fullWidth
-                        variant="contained"
-                        onClick={handleUnlockVault}
-                        sx={{ mt: 2 }}
-                        disabled={!password || !confirmPassword}
-                        startIcon={<LockOpenOutlined />}
-                    >
-                        Unlock Vault
-                    </Button>
-                ) : (
-                    <AnimatePresence>
-                        <MotionContainer
-                            initial={{ opacity: 0, y: 20 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -20 }}
-                            sx={{ mt: 3 }}
+                        <TextField
+                            fullWidth
+                            type="password"
+                            label="Confirm Password"
+                            value={confirmPassword}
+                            onChange={(e) => setConfirmPassword(e.target.value)}
+                            margin="normal"
+                            disabled={!isLocked && vaultItems.length > 0}
+                            // @ts-ignore deprecated but still functional
+                            InputProps={{
+                                startAdornment: <Security sx={{ mr: 1, color: 'text.secondary' }} />
+                            }}
+                        />
+                        <MotionBox
+                            initial={{ scaleX: 0 }}
+                            animate={{ scaleX: 1 }}
+                            transition={{ duration: 0.5 }}
+                            sx={{ mt: 1, height: 4, bgcolor: '#eee', transformOrigin: 'left' }}
                         >
-                            <Tabs 
-                                value={selectedTab} 
-                                onChange={(_, value) => setSelectedTab(value)} 
-                                sx={{ mb: 2 }}
-                                variant="fullWidth"
-                            >
-                                <Tab icon={<TextFields />} label="Text" value="text" />
-                                <Tab icon={<Upload />} label="File" value="file" />
-                            </Tabs>
+                            <Box
+                                sx={{
+                                    height: '100%',
+                                    width: `${(passwordStrength + 1) * 20}%`,
+                                    bgcolor: getPasswordStrengthColor(),
+                                    transition: 'all 0.3s'
+                                }}
+                            />
+                        </MotionBox>
+                    </Box>
 
-                            {selectedTab === 'text' ? (
-                                <TextField
-                                    fullWidth
-                                    multiline
-                                    rows={4}
-                                    label="Enter data to encrypt"
-                                    value={inputData}
-                                    onChange={(e) => setInputData(e.target.value)}
-                                    margin="normal"
-                                    sx={{ 
-                                        '& .MuiOutlinedInput-root': {
-                                            background: 'rgba(0, 0, 0, 0.1)'
-                                        }
-                                    }}
-                                />
-                            ) : (
-                                <Box sx={{ textAlign: 'center' }}>
-                                    <Button
-                                        variant="outlined"
-                                        component="label"
+                    {isLocked ? (
+                        <Button
+                            fullWidth
+                            variant="contained"
+                            onClick={handleUnlockVault}
+                            sx={{ mt: 2 }}
+                            disabled={!password || !confirmPassword}
+                            startIcon={<LockOpenOutlined />}
+                        >
+                            Unlock Vault
+                        </Button>
+                    ) : (
+                        <AnimatePresence>
+                            <MotionContainer
+                                initial={{ opacity: 0, y: 20 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: -20 }}
+                                sx={{ mt: 3 }}
+                            >
+                                <Tabs 
+                                    value={selectedTab} 
+                                    onChange={(_, value) => setSelectedTab(value)} 
+                                    sx={{ mb: 2 }}
+                                    variant="fullWidth"
+                                >
+                                    <Tab icon={<TextFields />} label="Text" value="text" />
+                                    <Tab icon={<Upload />} label="File" value="file" />
+                                </Tabs>
+
+                                {selectedTab === 'text' ? (
+                                    <TextField
                                         fullWidth
+                                        multiline
+                                        rows={4}
+                                        label="Enter data to encrypt"
+                                        value={inputData}
+                                        onChange={(e) => setInputData(e.target.value)}
+                                        margin="normal"
                                         sx={{ 
-                                            mt: 2,
-                                            height: 100,
-                                            border: '2px dashed',
-                                            borderColor: 'primary.main',
-                                            '&:hover': {
-                                                borderColor: 'primary.light'
+                                            '& .MuiOutlinedInput-root': {
+                                                background: 'rgba(0, 0, 0, 0.1)'
                                             }
                                         }}
+                                    />
+                                ) : (
+                                    <Box sx={{ textAlign: 'center' }}>
+                                        <Button
+                                            variant="outlined"
+                                            component="label"
+                                            fullWidth
+                                            sx={{ 
+                                                mt: 2,
+                                                height: 100,
+                                                border: '2px dashed',
+                                                borderColor: 'primary.main',
+                                                '&:hover': {
+                                                    borderColor: 'primary.light'
+                                                }
+                                            }}
+                                        >
+                                            <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                                                <Upload sx={{ fontSize: 40, mb: 1 }} />
+                                                Select Files
+                                            </Box>
+                                            <input
+                                                type="file"
+                                                hidden
+                                                multiple
+                                                onChange={handleFileSelect}
+                                                ref={fileInputRef}
+                                            />
+                                        </Button>
+                                        {selectedFiles.length > 0 && (
+                                            <Typography variant="body2" sx={{ mt: 1 }}>
+                                                {selectedFiles.length} file(s) selected
+                                            </Typography>
+                                        )}
+                                    </Box>
+                                )}
+
+                                <FormControl fullWidth sx={{ mt: 2 }}>
+                                    <InputLabel>Category</InputLabel>
+                                    <Select
+                                        value={category}
+                                        label="Category"
+                                        onChange={(e) => setCategory(e.target.value)}
+                                        startAdornment={<Category sx={{ mr: 1, color: 'text.secondary' }} />}
                                     >
-                                        <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                                            <Upload sx={{ fontSize: 40, mb: 1 }} />
-                                            Select Files
-                                        </Box>
-                                        <input
-                                            type="file"
-                                            hidden
-                                            multiple
-                                            onChange={handleFileSelect}
-                                            ref={fileInputRef}
-                                        />
+                                        <MenuItem value="general">📄 General</MenuItem>
+                                        <MenuItem value="personal">👤 Personal</MenuItem>
+                                        <MenuItem value="work">💼 Work</MenuItem>
+                                        <MenuItem value="financial">💰 Financial</MenuItem>
+                                    </Select>
+                                </FormControl>
+
+                                {selectedTab === 'text' ? (
+                                    <Button 
+                                        fullWidth 
+                                        variant="contained" 
+                                        onClick={handleAddItem}
+                                        sx={{ mt: 2 }}
+                                        disabled={!inputData}
+                                        startIcon={<ArrowDownward />}
+                                    >
+                                        Add to Vault
                                     </Button>
-                                    {selectedFiles.length > 0 && (
-                                        <Typography variant="body2" sx={{ mt: 1 }}>
-                                            {selectedFiles.length} file(s) selected
-                                        </Typography>
-                                    )}
-                                </Box>
-                            )}
+                                ) : (
+                                    <Button
+                                        fullWidth
+                                        variant="contained"
+                                        onClick={handleUploadFiles}
+                                        sx={{ mt: 2 }}
+                                        disabled={selectedFiles.length === 0}
+                                        startIcon={<Upload />}
+                                    >
+                                        Upload Files
+                                    </Button>
+                                )}
 
-                            <FormControl fullWidth sx={{ mt: 2 }}>
-                                <InputLabel>Category</InputLabel>
-                                <Select
-                                    value={category}
-                                    label="Category"
-                                    onChange={(e) => setCategory(e.target.value)}
-                                    startAdornment={<Category sx={{ mr: 1, color: 'text.secondary' }} />}
-                                >
-                                    <MenuItem value="general">📄 General</MenuItem>
-                                    <MenuItem value="personal">👤 Personal</MenuItem>
-                                    <MenuItem value="work">💼 Work</MenuItem>
-                                    <MenuItem value="financial">💰 Financial</MenuItem>
-                                </Select>
-                            </FormControl>
-
-                            {selectedTab === 'text' ? (
-                                <Button 
-                                    fullWidth 
-                                    variant="contained" 
-                                    onClick={handleAddItem}
-                                    sx={{ mt: 2 }}
-                                    disabled={!inputData}
-                                    startIcon={<ArrowDownward />}
-                                >
-                                    Add to Vault
-                                </Button>
-                            ) : (
                                 <Button
                                     fullWidth
                                     variant="contained"
-                                    onClick={handleUploadFiles}
+                                    color="secondary"
+                                    onClick={handleLockVault}
                                     sx={{ mt: 2 }}
-                                    disabled={selectedFiles.length === 0}
-                                    startIcon={<Upload />}
+                                    startIcon={<LockOutlined />}
                                 >
-                                    Upload Files
+                                    Lock Vault
                                 </Button>
-                            )}
 
-                            <Button
-                                fullWidth
-                                variant="contained"
-                                color="secondary"
-                                onClick={handleLockVault}
-                                sx={{ mt: 2 }}
-                                startIcon={<LockOutlined />}
-                            >
-                                Lock Vault
-                            </Button>
+                                <Box sx={{ mt: 2, display: 'flex', gap: 1 }}>
+                                    <Button
+                                        variant="outlined"
+                                        onClick={handleExport}
+                                        sx={{ flex: 1 }}
+                                        startIcon={<Download />}
+                                    >
+                                        Export Vault
+                                    </Button>
+                                    <Button
+                                        variant="outlined"
+                                        component="label"
+                                        sx={{ flex: 1 }}
+                                        startIcon={<Folder />}
+                                    >
+                                        Import Vault
+                                        <input
+                                            type="file"
+                                            hidden
+                                            accept=".json"
+                                            onChange={handleImport}
+                                        />
+                                    </Button>
+                                </Box>
+                            </MotionContainer>
+                        </AnimatePresence>
+                    )}
 
-                            <Box sx={{ mt: 2, display: 'flex', gap: 1 }}>
-                                <Button
-                                    variant="outlined"
-                                    onClick={handleExport}
-                                    sx={{ flex: 1 }}
-                                    startIcon={<Download />}
-                                >
-                                    Export Vault
-                                </Button>
-                                <Button
-                                    variant="outlined"
-                                    component="label"
-                                    sx={{ flex: 1 }}
-                                    startIcon={<Folder />}
-                                >
-                                    Import Vault
-                                    <input
-                                        type="file"
-                                        hidden
-                                        accept=".json"
-                                        onChange={handleImport}
-                                    />
-                                </Button>
-                            </Box>
-                        </MotionContainer>
-                    </AnimatePresence>
-                )}
-
-                {!isLocked && (
-                    <Box sx={{ mt: 4 }}>
-                        <Typography variant="h6" gutterBottom sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <Folder /> Vault Contents
-                        </Typography>
-                        {loading && <CircularProgress />}
-                        <AnimatePresence>
-                            {sortedVaultItems.map((item, index) => (
-                                <MotionContainer
-                                    key={item.id}
-                                    variants={itemVariants}
-                                    initial="hidden"
-                                    animate="visible"
-                                    exit="hidden"
-                                    transition={{ delay: index * 0.1 }}
-                                    sx={{ 
-                                        mb: 2, 
-                                        p: 2,
-                                        background: 'rgba(0, 0, 0, 0.2)',
-                                        backdropFilter: 'blur(10px)',
-                                        border: '1px solid rgba(255, 255, 255, 0.1)'
-                                    }}
-                                >
-                                    <Typography variant="caption" display="block" gutterBottom>
-                                        {getItemIcon(item.category)} {item.category}
-                                    </Typography>
-                                    {item.fileName && (
+                    {!isLocked && (
+                        <Box sx={{ mt: 4 }}>
+                            <Typography variant="h6" gutterBottom sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                <Folder /> Vault Contents
+                            </Typography>
+                            {loading && <CircularProgress />}
+                            <AnimatePresence>
+                                {sortedVaultItems.map((item, index) => (
+                                    <MotionContainer
+                                        key={item.id}
+                                        variants={itemVariants}
+                                        initial="hidden"
+                                        animate="visible"
+                                        exit="hidden"
+                                        transition={{ delay: index * 0.1 }}
+                                        sx={{ 
+                                            mb: 2, 
+                                            p: 2,
+                                            background: 'rgba(0, 0, 0, 0.2)',
+                                            backdropFilter: 'blur(10px)',
+                                            border: '1px solid rgba(255, 255, 255, 0.1)'
+                                        }}
+                                    >
                                         <Typography variant="caption" display="block" gutterBottom>
-                                            📎 {item.fileName}
+                                            {getItemIcon(item.category)} {item.category}
                                         </Typography>
-                                    )}
-                                    <Typography variant="body2" sx={{ mb: 1 }}>
-                                        {decryptedView[item.id] 
-                                            ? item.type === 'file' 
-                                                ? <Button startIcon={<Download />} href={decryptedView[item.id]} download={item.fileName}>
-                                                    Download File
-                                                  </Button>
-                                                : decryptedView[item.id]
-                                            : '***** Encrypted *****'}
-                                    </Typography>
-                                    <Box sx={{ display: 'flex', gap: 1 }}>
-                                        <IconButton
-                                            size="small"
-                                            onClick={() => handleDecrypt(item.id, item.encryptedData)}
-                                            color={decryptedView[item.id] ? 'success' : 'primary'}
-                                        >
-                                            {decryptedView[item.id] ? <VisibilityOff /> : <Visibility />}
-                                        </IconButton>
-                                        <Tooltip title="Delete">
+                                        {item.fileName && (
+                                            <Typography variant="caption" display="block" gutterBottom>
+                                                📎 {item.fileName}
+                                            </Typography>
+                                        )}
+                                        <Typography variant="body2" sx={{ mb: 1 }}>
+                                            {decryptedView[item.id] 
+                                                ? item.type === 'file' 
+                                                    ? <Button startIcon={<Download />} href={decryptedView[item.id]} download={item.fileName}>
+                                                        Download File
+                                                    </Button>
+                                                    : decryptedView[item.id]
+                                                : '***** Encrypted *****'}
+                                        </Typography>
+                                        <Box sx={{ display: 'flex', gap: 1 }}>
                                             <IconButton
                                                 size="small"
-                                                color="error"
-                                                onClick={() => handleDelete(item.id)}
+                                                onClick={() => handleDecrypt(item.id, item.encryptedData)}
+                                                color={decryptedView[item.id] ? 'success' : 'primary'}
                                             >
-                                                <Delete />
+                                                {decryptedView[item.id] ? <VisibilityOff /> : <Visibility />}
                                             </IconButton>
-                                        </Tooltip>
-                                    </Box>
-                                </MotionContainer>
-                            ))}
-                        </AnimatePresence>
-                    </Box>
-                )}
-            </MotionContainer>
+                                            <Tooltip title="Delete">
+                                                <IconButton
+                                                    size="small"
+                                                    color="error"
+                                                    onClick={() => handleDelete(item.id)}
+                                                >
+                                                    <Delete />
+                                                </IconButton>
+                                            </Tooltip>
+                                        </Box>
+                                    </MotionContainer>
+                                ))}
+                            </AnimatePresence>
+                        </Box>
+                    )}
+                </MotionContainer>
+            )}
         </Container>
     );
 };
